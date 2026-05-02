@@ -328,7 +328,7 @@ module Cloudtasker
       # the transaction and the concurrent update is preserved.
       #
       def rollback_pointer(previous_payload, expected_payload)
-        redis.client.with do |conn|
+        redis.with_connection do |conn|
           conn.watch(gid) do
             if conn.get(gid) == expected_payload
               conn.multi do |tx|

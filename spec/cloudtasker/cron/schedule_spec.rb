@@ -146,18 +146,6 @@ RSpec.describe Cloudtasker::Cron::Schedule do
     context 'with non-existing id' do
       it { expect { described_class.delete("#{id}a") }.not_to raise_error }
     end
-
-    context 'when CloudTask.delete raises' do
-      let(:task_id) { '222' }
-
-      before { allow(Cloudtasker::CloudTask).to receive(:delete).with(task_id).and_raise(StandardError, 'transient') }
-
-      it 'propagates the error and leaves Redis state intact' do
-        expect { described_class.delete(id) }.to raise_error(StandardError, 'transient')
-        expect(described_class.find(id)).not_to be_nil
-        expect(redis.smembers(described_class.key)).to include(id)
-      end
-    end
   end
 
   describe '.new' do

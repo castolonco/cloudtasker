@@ -62,6 +62,14 @@ module Cloudtasker
     end
 
     #
+    # Yield a checked-out connection. Use for stateful command sequences
+    # (e.g. WATCH/MULTI/EXEC) that must run on the same connection.
+    #
+    def with_connection(&block)
+      client.with(&block)
+    end
+
+    #
     # Acquire a lock on a cache entry.
     #
     # Locks are enforced to be short-lived (2s).
