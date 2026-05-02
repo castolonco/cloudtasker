@@ -255,6 +255,18 @@ RSpec.describe Cloudtasker::Cron::Job do
       after { expect(job.state).to eq(:processing) }
       it { expect { job.execute { raise(StandardError) } }.to raise_error(StandardError) }
     end
+
+    context 'when schedule! raises' do
+      before do
+        allow(job).to receive_messages(cron_schedule: cron_schedule, expected_instance?: true)
+        allow(job).to receive(:schedule!).and_raise(StandardError)
+      end
+
+      it 'does not set the processing flag' do
+        expect { job.execute { :should_not_run } }.to raise_error(StandardError)
+        expect(job.state).to be_nil
+      end
+    end
   end
 
   # When persist_cloud_task fires (CloudTask.find returns nil for the
