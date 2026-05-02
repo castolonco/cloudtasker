@@ -255,7 +255,6 @@ RSpec.describe Cloudtasker::Cron::Job do
       after { expect(job.state).to eq(:processing) }
       it { expect { job.execute { raise(StandardError) } }.to raise_error(StandardError) }
     end
-
   end
 
   # When persist_cloud_task fires (CloudTask.find returns nil for the
@@ -277,8 +276,7 @@ RSpec.describe Cloudtasker::Cron::Job do
         successor_task
       end
 
-      allow(Cloudtasker::CloudTask).to receive(:find).and_return(nil)
-      allow(Cloudtasker::CloudTask).to receive(:delete).and_return(true)
+      allow(Cloudtasker::CloudTask).to receive_messages(find: nil, delete: true)
     end
 
     it 'allows a Cloud Tasks retry of the original task to repair the chain' do
@@ -286,41 +284,41 @@ RSpec.describe Cloudtasker::Cron::Job do
         .to raise_error(StandardError, 'transient cloud tasks api error')
 
       # Model the transient API error clearing.
-      allow(Cloudtasker::CloudTask).to receive(:create).and_return(successor_task)
-      allow(Cloudtasker::CloudTask).to receive(:find).and_return(successor_task)
+      allow(Cloudtasker::CloudTask).to receive_messages(create: successor_task, find: successor_task)
 
       # Cloud Tasks retries the same task: same job_id, fresh Cron::Job.
-      retry_job = described_class.new(worker)
-      allow(retry_job).to receive(:schedule!).and_call_original
-      retry_job.execute { :perform_block_can_run }
+      described_class.new(worker).execute { :perform_block_can_run }
 
-      expect(retry_job).to have_received(:schedule!)
+      expect(Cloudtasker::Cron::Schedule.find(schedule_id).task_id).to eq('successor-task-id')
     end
 
-    it 'does not clobber a concurrent update during rollback' do
-      concurrent_state = { id: schedule_id, cron: cron, worker: worker.class.to_s,
-                           args: nil, queue: nil, task_id: 'concurrent-task',
-                           job_id: 'concurrent-job-id' }
-
-      # On the recursive create (call >= 2), simulate a concurrent process
-      # writing a different state to the same gid before raising.
-      create_calls = 0
-      allow(Cloudtasker::CloudTask).to receive(:create) do
-        create_calls += 1
-        if create_calls >= 2
-          Cloudtasker::Cron::Schedule.redis.write(cron_schedule.gid, concurrent_state)
-          raise StandardError, 'transient cloud tasks api error'
-        end
-
-        successor_task
+    context 'when a concurrent process updates the schedule before the recursive create raises' do
+      let(:concurrent_state) do
+        { id: schedule_id, cron: cron, worker: worker.class.to_s,
+          args: nil, queue: nil, task_id: 'concurrent-task',
+          job_id: 'concurrent-job-id' }
       end
 
-      expect { job.execute { :perform_block_should_not_run } }
-        .to raise_error(StandardError, 'transient cloud tasks api error')
+      before do
+        create_calls = 0
+        allow(Cloudtasker::CloudTask).to receive(:create) do
+          create_calls += 1
+          if create_calls >= 2
+            Cloudtasker::Cron::Schedule.redis.write(cron_schedule.gid, concurrent_state)
+            raise StandardError, 'transient cloud tasks api error'
+          end
+
+          successor_task
+        end
+      end
 
       # The rescue should detect the concurrent update and leave it alone
       # rather than restoring our previous_state.
-      expect(Cloudtasker::Cron::Schedule.find(schedule_id).task_id).to eq('concurrent-task')
+      it 'leaves the concurrent state intact rather than restoring previous_state' do
+        expect { job.execute { :perform_block_should_not_run } }
+          .to raise_error(StandardError, 'transient cloud tasks api error')
+        expect(Cloudtasker::Cron::Schedule.find(schedule_id).task_id).to eq('concurrent-task')
+      end
     end
   end
 end

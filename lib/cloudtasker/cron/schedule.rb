@@ -279,13 +279,13 @@ module Cloudtasker
       def save(update_task: true)
         return false unless valid?
 
-        # Snapshot prior state for rollback if persist_cloud_task raises.
-        previous_state = redis.fetch(gid)
-
-        # Save schedule
+        # Capture the prior and new payloads as raw bytes so the rollback's
+        # match check is not sensitive to any later mutation of self.
+        previous_payload = redis.get(gid)
         config_was_changed = config_changed?
         redis.sadd(self.class.key, [id])
-        redis.write(gid, to_h)
+        payload = to_h.to_json
+        redis.set(gid, payload)
 
         # Stop there if backend does not need update
         return true unless update_task && (config_was_changed || !task_id || !CloudTask.find(task_id))
@@ -298,7 +298,7 @@ module Cloudtasker
         begin
           persist_cloud_task
         rescue StandardError
-          rollback_pointer(previous_state)
+          rollback_pointer(previous_payload, payload)
           raise
         end
 
@@ -327,23 +327,21 @@ module Cloudtasker
       # If the watched key was modified between WATCH and EXEC, Redis aborts
       # the transaction and the concurrent update is preserved.
       #
-      def rollback_pointer(previous_state)
-        expected_payload = to_h.to_json
-
+      def rollback_pointer(previous_payload, expected_payload)
         redis.client.with do |conn|
-          conn.watch(gid)
-
-          if conn.get(gid) == expected_payload
-            conn.multi do |tx|
-              if previous_state
-                tx.set(gid, previous_state.to_json)
-              else
-                tx.del(gid)
-                tx.srem(self.class.key, id)
+          conn.watch(gid) do
+            if conn.get(gid) == expected_payload
+              conn.multi do |tx|
+                if previous_payload
+                  tx.set(gid, previous_payload)
+                else
+                  tx.del(gid)
+                  tx.srem(self.class.key, id)
+                end
               end
+            else
+              conn.unwatch
             end
-          else
-            conn.unwatch
           end
         end
       end
