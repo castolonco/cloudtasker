@@ -279,6 +279,14 @@ module Cloudtasker
       def save(update_task: true)
         return false unless valid?
 
+        # Capture the current persisted state so we can roll back the schedule
+        # pointer if persist_cloud_task fails. Without this, a transient error
+        # in the recursive schedule! (e.g., Cloud Tasks 5xx) would leave Redis
+        # pointing at a task that was just deleted by persist_cloud_task,
+        # while the original task's Cloud Tasks retry would silent-abort
+        # because expected_instance? no longer matches — orphaning the cron.
+        previous_state = redis.fetch(gid)
+
         # Save schedule
         config_was_changed = config_changed?
         redis.sadd(self.class.key, [id])
@@ -287,8 +295,21 @@ module Cloudtasker
         # Stop there if backend does not need update
         return true unless update_task && (config_was_changed || !task_id || !CloudTask.find(task_id))
 
-        # Update backend
-        persist_cloud_task
+        # Update backend. Roll back the Redis pointer on failure so a Cloud
+        # Tasks retry of the original task can recover via expected_instance?.
+        begin
+          persist_cloud_task
+        rescue StandardError
+          if previous_state
+            redis.write(gid, previous_state)
+          else
+            redis.del(gid)
+            redis.srem(self.class.key, [id])
+          end
+          raise
+        end
+
+        true
       end
 
       private
@@ -296,12 +317,19 @@ module Cloudtasker
       #
       # Update the task in backend.
       #
+      # Creates the replacement task BEFORE deleting the existing one so a
+      # failure inside the recursive schedule! leaves the existing task in
+      # the queue and the schedule pointer (in Redis) unchanged.
+      #
       def persist_cloud_task
-        # Delete previous instance
-        CloudTask.delete(task_id) if task_id
+        old_task_id = task_id
 
-        # Schedule worker
+        # Schedule worker first so a failure here doesn't strand us with no
+        # task in the queue.
         Job.new(worker_instance).set(schedule_id: id).schedule!
+
+        # Replacement is now in place; safe to remove the old task.
+        CloudTask.delete(old_task_id) if old_task_id
       end
     end
   end

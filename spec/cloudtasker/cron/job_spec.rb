@@ -255,5 +255,74 @@ RSpec.describe Cloudtasker::Cron::Job do
       after { expect(job.state).to eq(:processing) }
       it { expect { job.execute { raise(StandardError) } }.to raise_error(StandardError) }
     end
+
+  end
+
+  # Regression test: the cron chain should be self-healing if a transient
+  # error occurs during creation of the next iteration's task. See the
+  # failure mode described in the comments below.
+  #
+  # 1. Outer schedule! creates successor task B in Cloud Tasks, then calls
+  #    cron_schedule.update(task_id: B, job_id: B). Schedule#save writes
+  #    cron_schedule = { task_id: B, job_id: B } to Redis.
+  # 2. Schedule#save's safety check calls CloudTask.find(B). This can
+  #    return nil for legitimate reasons — e.g., a task with a past
+  #    schedule_time was dispatched and removed from the queue before
+  #    find ran (Cloud Tasks' documented behavior on completed tasks).
+  # 3. persist_cloud_task fires: deletes task B, then runs a recursive
+  #    Cron::Job#schedule! to create a replacement task C.
+  # 4. The recursive schedule! fails (transient Cloud Tasks 5xx, network
+  #    blip, instance termination, etc.) before C is created.
+  # 5. The exception propagates out of the outer schedule!. Cloud Tasks
+  #    retries the original task A.
+  # 6. On retry, expected_instance? evaluates retry_instance? || (
+  #    cron_schedule.job_id == job_id ). Both are false: state for A.job_id
+  #    was never set (schedule! raised before flag(:processing)); and
+  #    cron_schedule.job_id was advanced to B in step 1's redis.write.
+  #    The retry silent-aborts (Cloud Tasks ack-200) without calling
+  #    schedule!. Net: cron_schedule.job_id points at task B, but B was
+  #    deleted in step 3 and never replaced. The cron entry stays dead
+  #    until something external re-registers it.
+  describe '#execute (chain-break regression)' do
+    let(:successor_task) { instance_double(Cloudtasker::CloudTask, id: 'successor-task-id') }
+
+    before do
+      worker.job_meta.set(job.key(:schedule_id), schedule_id)
+      cron_schedule.assign_attributes(task_id: 'pre-existing-task', job_id: worker.job_id)
+      cron_schedule.save(update_task: false)
+
+      create_calls = 0
+      allow(Cloudtasker::CloudTask).to receive(:create) do
+        create_calls += 1
+        raise StandardError, 'transient cloud tasks api error' if create_calls >= 2
+
+        successor_task
+      end
+
+      allow(Cloudtasker::CloudTask).to receive(:find).and_return(nil)
+      allow(Cloudtasker::CloudTask).to receive(:delete).and_return(true)
+    end
+
+    it 'allows a Cloud Tasks retry of the original task to repair the chain' do
+      # First invocation triggers the persist_cloud_task / recursive-fail
+      # path. The exception propagates so Cloud Tasks will retry.
+      expect { job.execute { :perform_block_should_not_run } }
+        .to raise_error(StandardError, 'transient cloud tasks api error')
+
+      # Model the transient API error clearing for the retry: create now
+      # succeeds, and find now returns the task it just created (so the
+      # persist_cloud_task self-heal path no longer fires).
+      allow(Cloudtasker::CloudTask).to receive(:create).and_return(successor_task)
+      allow(Cloudtasker::CloudTask).to receive(:find).and_return(successor_task)
+
+      # Cloud Tasks retries the same task. Same job_id, fresh Cron::Job.
+      retry_job = described_class.new(worker)
+      allow(retry_job).to receive(:schedule!).and_call_original
+
+      retry_job.execute { :perform_block_can_run }
+
+      # The retry should have run schedule! to repair the chain.
+      expect(retry_job).to have_received(:schedule!)
+    end
   end
 end
