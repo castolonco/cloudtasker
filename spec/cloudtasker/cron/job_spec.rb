@@ -280,14 +280,10 @@ RSpec.describe Cloudtasker::Cron::Job do
       cron_schedule.assign_attributes(task_id: 'pre-existing-task', job_id: worker.job_id)
       cron_schedule.save(update_task: false)
 
-      create_calls = 0
-      allow(Cloudtasker::CloudTask).to receive(:create) do
-        create_calls += 1
-        raise StandardError, 'transient cloud tasks api error' if create_calls >= 2
-
-        successor_task
-      end
-
+      allow(Cloudtasker::CloudTask).to receive(:create).and_invoke(
+        ->(*) { successor_task },
+        ->(*) { raise StandardError, 'transient cloud tasks api error' }
+      )
       allow(Cloudtasker::CloudTask).to receive_messages(find: nil, delete: true)
     end
 
@@ -312,16 +308,13 @@ RSpec.describe Cloudtasker::Cron::Job do
       end
 
       before do
-        create_calls = 0
-        allow(Cloudtasker::CloudTask).to receive(:create) do
-          create_calls += 1
-          if create_calls >= 2
+        allow(Cloudtasker::CloudTask).to receive(:create).and_invoke(
+          ->(*) { successor_task },
+          lambda { |*|
             Cloudtasker::Cron::Schedule.redis.write(cron_schedule.gid, concurrent_state)
             raise StandardError, 'transient cloud tasks api error'
-          end
-
-          successor_task
-        end
+          }
+        )
       end
 
       # The rescue should detect the concurrent update and leave it alone

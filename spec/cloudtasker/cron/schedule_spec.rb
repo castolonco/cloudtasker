@@ -426,11 +426,9 @@ RSpec.describe Cloudtasker::Cron::Schedule do
       before { allow(schedule).to receive(:config_changed?).and_return(true) }
 
       it 'creates the replacement task before deleting the existing one' do
-        call_order = []
-        allow(job).to receive(:schedule!) { call_order << :create }
-        allow(Cloudtasker::CloudTask).to receive(:delete) { |arg| call_order << [:delete, arg] }
+        expect(job).to receive(:schedule!).ordered
+        expect(Cloudtasker::CloudTask).to receive(:delete).with(task_id).ordered
         schedule.save
-        expect(call_order).to eq([:create, [:delete, task_id]])
       end
     end
 
