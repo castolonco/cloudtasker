@@ -279,12 +279,7 @@ module Cloudtasker
       def save(update_task: true)
         return false unless valid?
 
-        # Capture the current persisted state so we can roll back the schedule
-        # pointer if persist_cloud_task fails. Without this, a transient error
-        # in the recursive schedule! (e.g., Cloud Tasks 5xx) would leave Redis
-        # pointing at a task that was just deleted by persist_cloud_task,
-        # while the original task's Cloud Tasks retry would silent-abort
-        # because expected_instance? no longer matches — orphaning the cron.
+        # Snapshot prior state for rollback if persist_cloud_task raises.
         previous_state = redis.fetch(gid)
 
         # Save schedule
@@ -295,7 +290,7 @@ module Cloudtasker
         # Stop there if backend does not need update
         return true unless update_task && (config_was_changed || !task_id || !CloudTask.find(task_id))
 
-        # Update backend. Roll back the Redis pointer on failure so a Cloud
+        # Update backend. On failure, restore the Redis pointer so a Cloud
         # Tasks retry of the original task can recover via expected_instance?.
         begin
           persist_cloud_task
@@ -317,18 +312,12 @@ module Cloudtasker
       #
       # Update the task in backend.
       #
-      # Creates the replacement task BEFORE deleting the existing one so a
-      # failure inside the recursive schedule! leaves the existing task in
-      # the queue and the schedule pointer (in Redis) unchanged.
+      # Schedules the replacement task before deleting the existing one so a
+      # failure here leaves the existing task in the queue.
       #
       def persist_cloud_task
         old_task_id = task_id
-
-        # Schedule worker first so a failure here doesn't strand us with no
-        # task in the queue.
         Job.new(worker_instance).set(schedule_id: id).schedule!
-
-        # Replacement is now in place; safe to remove the old task.
         CloudTask.delete(old_task_id) if old_task_id
       end
     end
