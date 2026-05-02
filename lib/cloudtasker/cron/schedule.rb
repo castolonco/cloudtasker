@@ -292,19 +292,13 @@ module Cloudtasker
 
         # Update backend. On failure, restore the Redis pointer so a Cloud
         # Tasks retry of the original task can recover via expected_instance?.
-        # Only roll back if no concurrent process has updated the pointer
-        # since our write — otherwise we'd clobber their successful update.
+        # The rollback is wrapped in WATCH/MULTI/EXEC so that if a concurrent
+        # process updated the pointer in the meantime, Redis aborts the
+        # transaction and their write is preserved.
         begin
           persist_cloud_task
         rescue StandardError
-          if redis.fetch(gid) == to_h
-            if previous_state
-              redis.write(gid, previous_state)
-            else
-              redis.del(gid)
-              redis.srem(self.class.key, [id])
-            end
-          end
+          rollback_pointer(previous_state)
           raise
         end
 
@@ -323,6 +317,35 @@ module Cloudtasker
         old_task_id = task_id
         Job.new(worker_instance).set(schedule_id: id).schedule!
         CloudTask.delete(old_task_id) if old_task_id
+      end
+
+      #
+      # Atomically restore the schedule pointer to the given prior state, but
+      # only if no concurrent process has updated it since our write.
+      #
+      # Uses WATCH/MULTI/EXEC so the comparison and the restore are atomic.
+      # If the watched key was modified between WATCH and EXEC, Redis aborts
+      # the transaction and the concurrent update is preserved.
+      #
+      def rollback_pointer(previous_state)
+        expected_payload = to_h.to_json
+
+        redis.client.with do |conn|
+          conn.watch(gid)
+
+          if conn.get(gid) == expected_payload
+            conn.multi do |tx|
+              if previous_state
+                tx.set(gid, previous_state.to_json)
+              else
+                tx.del(gid)
+                tx.srem(self.class.key, id)
+              end
+            end
+          else
+            conn.unwatch
+          end
+        end
       end
     end
   end
