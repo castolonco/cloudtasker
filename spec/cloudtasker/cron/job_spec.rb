@@ -296,5 +296,31 @@ RSpec.describe Cloudtasker::Cron::Job do
 
       expect(retry_job).to have_received(:schedule!)
     end
+
+    it 'does not clobber a concurrent update during rollback' do
+      concurrent_state = { id: schedule_id, cron: cron, worker: worker.class.to_s,
+                           args: nil, queue: nil, task_id: 'concurrent-task',
+                           job_id: 'concurrent-job-id' }
+
+      # On the recursive create (call >= 2), simulate a concurrent process
+      # writing a different state to the same gid before raising.
+      create_calls = 0
+      allow(Cloudtasker::CloudTask).to receive(:create) do
+        create_calls += 1
+        if create_calls >= 2
+          Cloudtasker::Cron::Schedule.redis.write(cron_schedule.gid, concurrent_state)
+          raise StandardError, 'transient cloud tasks api error'
+        end
+
+        successor_task
+      end
+
+      expect { job.execute { :perform_block_should_not_run } }
+        .to raise_error(StandardError, 'transient cloud tasks api error')
+
+      # The rescue should detect the concurrent update and leave it alone
+      # rather than restoring our previous_state.
+      expect(Cloudtasker::Cron::Schedule.find(schedule_id).task_id).to eq('concurrent-task')
+    end
   end
 end

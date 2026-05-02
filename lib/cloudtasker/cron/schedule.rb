@@ -292,14 +292,18 @@ module Cloudtasker
 
         # Update backend. On failure, restore the Redis pointer so a Cloud
         # Tasks retry of the original task can recover via expected_instance?.
+        # Only roll back if no concurrent process has updated the pointer
+        # since our write — otherwise we'd clobber their successful update.
         begin
           persist_cloud_task
         rescue StandardError
-          if previous_state
-            redis.write(gid, previous_state)
-          else
-            redis.del(gid)
-            redis.srem(self.class.key, [id])
+          if redis.fetch(gid) == to_h
+            if previous_state
+              redis.write(gid, previous_state)
+            else
+              redis.del(gid)
+              redis.srem(self.class.key, [id])
+            end
           end
           raise
         end
