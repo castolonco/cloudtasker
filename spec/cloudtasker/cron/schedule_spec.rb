@@ -407,5 +407,48 @@ RSpec.describe Cloudtasker::Cron::Schedule do
       after { expect(Cloudtasker::CloudTask).to have_received(:delete).with(task_id) }
       it { is_expected.to be_truthy }
     end
+
+    context 'when persist_cloud_task succeeds' do
+      let(:task_id) { '222' }
+
+      before { allow(schedule).to receive(:config_changed?).and_return(true) }
+
+      it 'creates the replacement task before deleting the existing one' do
+        expect(job).to receive(:schedule!).ordered
+        expect(Cloudtasker::CloudTask).to receive(:delete).with(task_id).ordered
+        schedule.save
+      end
+    end
+
+    context 'when persist_cloud_task raises with prior state' do
+      let(:task_id) { '111' }
+
+      before do
+        schedule.save(update_task: false)
+        schedule.assign_attributes(task_id: '222')
+        allow(job).to receive(:schedule!).and_raise(StandardError, 'persist failed')
+      end
+
+      it 'restores the prior Redis payload' do
+        original_payload = redis.get(schedule.gid)
+        expect { schedule.save }.to raise_error(StandardError, 'persist failed')
+        expect(redis.get(schedule.gid)).to eq(original_payload)
+      end
+
+      it 'does not delete the existing task' do
+        expect(Cloudtasker::CloudTask).not_to receive(:delete)
+        expect { schedule.save }.to raise_error(StandardError, 'persist failed')
+      end
+    end
+
+    context 'when persist_cloud_task raises with no prior state' do
+      before { allow(job).to receive(:schedule!).and_raise(StandardError) }
+
+      it 'deletes the gid and removes id from the set' do
+        expect { schedule.save }.to raise_error(StandardError)
+        expect(redis.get(schedule.gid)).to be_nil
+        expect(redis.smembers(described_class.key)).not_to include(schedule.id)
+      end
+    end
   end
 end

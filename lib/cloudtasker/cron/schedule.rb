@@ -279,16 +279,30 @@ module Cloudtasker
       def save(update_task: true)
         return false unless valid?
 
-        # Save schedule
+        # Capture the prior and new payloads as raw bytes so the rollback's
+        # match check is not sensitive to any later mutation of self.
+        previous_payload = redis.get(gid)
         config_was_changed = config_changed?
         redis.sadd(self.class.key, [id])
-        redis.write(gid, to_h)
+        payload = to_h.to_json
+        redis.set(gid, payload)
 
         # Stop there if backend does not need update
         return true unless update_task && (config_was_changed || !task_id || !CloudTask.find(task_id))
 
-        # Update backend
-        persist_cloud_task
+        # Update backend. On failure, restore the Redis pointer so a Cloud
+        # Tasks retry of the original task can recover via expected_instance?.
+        # The rollback is wrapped in WATCH/MULTI/EXEC so that if a concurrent
+        # process updated the pointer in the meantime, Redis aborts the
+        # transaction and their write is preserved.
+        begin
+          persist_cloud_task
+        rescue StandardError
+          rollback_pointer(previous_payload, payload)
+          raise
+        end
+
+        true
       end
 
       private
@@ -296,12 +310,40 @@ module Cloudtasker
       #
       # Update the task in backend.
       #
+      # Schedules the replacement task before deleting the existing one so a
+      # failure here leaves the existing task in the queue.
+      #
       def persist_cloud_task
-        # Delete previous instance
-        CloudTask.delete(task_id) if task_id
-
-        # Schedule worker
+        old_task_id = task_id
         Job.new(worker_instance).set(schedule_id: id).schedule!
+        CloudTask.delete(old_task_id) if old_task_id
+      end
+
+      #
+      # Atomically restore the schedule pointer to the given prior state, but
+      # only if no concurrent process has updated it since our write.
+      #
+      # Uses WATCH/MULTI/EXEC so the comparison and the restore are atomic.
+      # If the watched key was modified between WATCH and EXEC, Redis aborts
+      # the transaction and the concurrent update is preserved.
+      #
+      def rollback_pointer(previous_payload, expected_payload)
+        redis.with_connection do |conn|
+          conn.watch(gid) do
+            if conn.get(gid) == expected_payload
+              conn.multi do |tx|
+                if previous_payload
+                  tx.set(gid, previous_payload)
+                else
+                  tx.del(gid)
+                  tx.srem(self.class.key, id)
+                end
+              end
+            else
+              conn.unwatch
+            end
+          end
+        end
       end
     end
   end
